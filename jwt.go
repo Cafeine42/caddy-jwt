@@ -179,6 +179,9 @@ func (ja *JWTAuth) usingJWK() bool {
 }
 
 func (ja *JWTAuth) setupJWKLoader() {
+	repl := caddy.NewReplacer()
+	// Replace placeholders in the signKey such as {file./path/to/sign_key.txt}
+	ja.JWKURL = repl.ReplaceAll(ja.JWKURL, "")
 	cache := jwk.NewCache(context.Background(), jwk.WithErrSink(ja))
 	cache.Register(ja.JWKURL)
 	ja.jwkCache = cache
