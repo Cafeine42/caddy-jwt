@@ -50,6 +50,8 @@ type JWTAuth struct {
 	// publish the JWKs in the standard format as described in
 	// https://tools.ietf.org/html/rfc7517.
 	// If you'd like to use JWK, set this field and leave SignKey unset.
+	//
+	// This value supports placeholders that will be resolved dynamically with each request.
 	JWKURL string `json:"jwk_url"`
 
 	// SignAlgorithm is the signing algorithm used. Available values are defined in
@@ -150,8 +152,7 @@ type JWTAuth struct {
 	logger        *zap.Logger
 	parsedSignKey interface{} // can be []byte, *rsa.PublicKey, *ecdsa.PublicKey, etc.
 
-	jwkCache     *jwk.Cache
-	jwkCachedSet jwk.Set
+	jwkCache *jwk.Cache
 }
 
 // CaddyModule implements caddy.Module interface.
@@ -179,21 +180,26 @@ func (ja *JWTAuth) usingJWK() bool {
 }
 
 func (ja *JWTAuth) setupJWKLoader() {
-	repl := caddy.NewReplacer()
-	// Replace placeholders in the signKey such as {file./path/to/sign_key.txt}
-	ja.JWKURL = repl.ReplaceAll(ja.JWKURL, "")
 	cache := jwk.NewCache(context.Background(), jwk.WithErrSink(ja))
-	cache.Register(ja.JWKURL)
 	ja.jwkCache = cache
-	ja.refreshJWKCache()
-	ja.jwkCachedSet = jwk.NewCachedSet(cache, ja.JWKURL)
-	ja.logger.Info("using JWKs from URL", zap.String("url", ja.JWKURL), zap.Int("loaded_keys", ja.jwkCachedSet.Len()))
+
+	// Nous n'enregistrons pas d'URL fixe ici car l'URL peut changer
+	// à chaque requête en fonction de la résolution du placeholder
+
+	ja.logger.Info("using JWKs from dynamic URL", zap.String("url_template", ja.JWKURL))
 }
 
 // refreshJWKCache refreshes the JWK cache. It validates the JWKs from the given URL.
-func (ja *JWTAuth) refreshJWKCache() {
-	_, err := ja.jwkCache.Refresh(context.Background(), ja.JWKURL)
-	ja.logger.Warn("failed to refresh JWK cache", zap.Error(err))
+// jwkurl must be the resolved URL with placeholders replaced
+func (ja *JWTAuth) refreshJWKCache(jwkurl string) {
+	if err := ja.jwkCache.Register(jwkurl); err != nil {
+		ja.logger.Warn("failed to register JWK URL", zap.String("url", jwkurl), zap.Error(err))
+		return
+	}
+	_, err := ja.jwkCache.Refresh(context.Background(), jwkurl)
+	if err != nil {
+		ja.logger.Warn("failed to refresh JWK cache", zap.String("url", jwkurl), zap.Error(err))
+	}
 }
 
 // Validate implements caddy.Validator interface.
@@ -245,13 +251,33 @@ func (ja *JWTAuth) validateSignatureKeys() error {
 }
 
 func (ja *JWTAuth) keyProvider() jws.KeyProviderFunc {
-	return func(_ context.Context, sink jws.KeySink, sig *jws.Signature, _ *jws.Message) error {
+	return func(ctx context.Context, sink jws.KeySink, sig *jws.Signature, _ *jws.Message) error {
 		if ja.usingJWK() {
+			// Pour chaque appel, résoudre le placeholder dans l'URL JWK
+			repl := caddy.NewReplacer()
+			jwkurl := repl.ReplaceAll(ja.JWKURL, "")
+
+			// Vérifier si l'URL JWK est déjà enregistrée dans le cache
+			_, err := ja.jwkCache.Get(ctx, jwkurl)
+			if err != nil {
+				// Si non, enregistrer et rafraîchir le cache pour cette URL
+				ja.refreshJWKCache(jwkurl)
+			}
+
+			// Chercher la clé par kid
 			kid := sig.ProtectedHeaders().KeyID()
-			key, found := ja.jwkCachedSet.LookupKeyID(kid)
+			set, err := ja.jwkCache.Get(ctx, jwkurl)
+			if err != nil {
+				if kid == "" {
+					return fmt.Errorf("missing kid in JWT header")
+				}
+				return fmt.Errorf("failed to get JWK set from URL %q: %w", jwkurl, err)
+			}
+
+			key, found := set.LookupKeyID(kid)
 			if !found {
 				// trigger a refresh if the key is not found
-				go ja.refreshJWKCache()
+				go ja.refreshJWKCache(jwkurl)
 
 				if kid == "" {
 					return fmt.Errorf("missing kid in JWT header")
