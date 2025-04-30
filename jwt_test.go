@@ -153,9 +153,20 @@ func issueTokenStringEdDSA(claims MapClaims) string {
 	return string(tokenBytes)
 }
 
-func issueTokenStringJWK(claims MapClaims) string {
+func issueTokenStringJWK(claims MapClaims, options ...func(*jwt.SignOption)) string {
 	token := buildToken(claims)
-	tokenBytes, err := jwt.Sign(token, jwt.WithKey(jwa.RS256, jwkKey))
+
+	// Options par défaut
+	signOptions := []jwt.SignOption{jwt.WithKey(jwa.RS256, jwkKey)}
+
+	// Appliquer les options supplémentaires
+	for _, opt := range options {
+		var option jwt.SignOption
+		opt(&option)
+		signOptions = append(signOptions, option)
+	}
+
+	tokenBytes, err := jwt.Sign(token, signOptions...)
 	panicOnError(err)
 
 	return string(tokenBytes)
@@ -772,8 +783,8 @@ func TestJWK(t *testing.T) {
 	time.Sleep(3 * time.Second)
 	ja := &JWTAuth{JWKURL: TestJWKURL, logger: testLogger}
 	assert.Nil(t, ja.Validate())
-	assert.Equal(t, 1, ja.jwkCachedSet.Len())
 
+	// Le cache sera créé lors de la première authentification
 	token := issueTokenStringJWK(MapClaims{"sub": "ggicci"})
 	rw := httptest.NewRecorder()
 	r, _ := http.NewRequest("GET", "/", nil)
@@ -782,14 +793,21 @@ func TestJWK(t *testing.T) {
 	assert.Nil(t, err)
 	assert.True(t, authenticated)
 	assert.Equal(t, User{ID: "ggicci"}, gotUser)
+
+	// Vérifier que le cache a bien été créé pour l'URL
+	assert.NotNil(t, ja.jwkCaches)
+	cachedEntry, exists := ja.jwkCaches[TestJWKURL]
+	assert.True(t, exists, "Le cache devrait exister pour l'URL de test")
+	assert.NotNil(t, cachedEntry)
+	assert.Equal(t, 1, cachedEntry.cachedSet.Len())
 }
 
 func TestJWKSet(t *testing.T) {
 	time.Sleep(3 * time.Second)
 	ja := &JWTAuth{JWKURL: TestJWKSetURL, logger: testLogger}
 	assert.Nil(t, ja.Validate())
-	assert.Equal(t, 2, ja.jwkCachedSet.Len())
 
+	// Authentifier pour créer le cache
 	token := issueTokenStringJWK(MapClaims{"sub": "ggicci"})
 	rw := httptest.NewRecorder()
 	r, _ := http.NewRequest("GET", "/", nil)
@@ -798,19 +816,35 @@ func TestJWKSet(t *testing.T) {
 	assert.Nil(t, err)
 	assert.True(t, authenticated)
 	assert.Equal(t, User{ID: "ggicci"}, gotUser)
+
+	// Vérifier que le cache a été créé correctement
+	assert.NotNil(t, ja.jwkCaches)
+	cachedEntry, exists := ja.jwkCaches[TestJWKSetURL]
+	assert.True(t, exists, "Le cache devrait exister pour l'URL du set JWK")
+	assert.NotNil(t, cachedEntry)
+	assert.Equal(t, 2, cachedEntry.cachedSet.Len())
 }
 
 func TestJWKSet_KeyNotFound(t *testing.T) {
 	time.Sleep(3 * time.Second)
 	ja := &JWTAuth{JWKURL: TestJWKSetURLInapplicable, logger: testLogger}
 	assert.Nil(t, ja.Validate())
-	assert.Equal(t, 2, ja.jwkCachedSet.Len())
 
+	// Première requête pour créer le cache
 	token := issueTokenStringJWK(MapClaims{"sub": "ggicci"})
 	rw := httptest.NewRecorder()
 	r, _ := http.NewRequest("GET", "/", nil)
 	r.Header.Add("Authorization", "Bearer "+token)
 	gotUser, authenticated, err := ja.Authenticate(rw, r)
+
+	// Vérifier que le cache a été créé correctement
+	assert.NotNil(t, ja.jwkCaches)
+	cachedEntry, exists := ja.jwkCaches[TestJWKSetURLInapplicable]
+	assert.True(t, exists, "Le cache devrait exister pour l'URL inapplicable")
+	assert.NotNil(t, cachedEntry)
+	assert.Equal(t, 2, cachedEntry.cachedSet.Len())
+
+	// Vérifier que l'authentification a échoué car la clé n'est pas trouvée
 	assert.Error(t, err)
 	assert.False(t, authenticated)
 	assert.Empty(t, gotUser.ID)

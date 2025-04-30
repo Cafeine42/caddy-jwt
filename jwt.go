@@ -150,8 +150,11 @@ type JWTAuth struct {
 	logger        *zap.Logger
 	parsedSignKey interface{} // can be []byte, *rsa.PublicKey, *ecdsa.PublicKey, etc.
 
-	jwkCache     *jwk.Cache
-	jwkCachedSet jwk.Set
+	// Cache JWK par URL résolue pour supporter les placeholders dans JWKURL
+	jwkCaches map[string]*struct {
+		cache     *jwk.Cache
+		cachedSet jwk.Set
+	}
 }
 
 // CaddyModule implements caddy.Module interface.
@@ -179,21 +182,72 @@ func (ja *JWTAuth) usingJWK() bool {
 }
 
 func (ja *JWTAuth) setupJWKLoader() {
-	repl := caddy.NewReplacer()
-	// Replace placeholders in the signKey such as {file./path/to/sign_key.txt}
-	ja.JWKURL = repl.ReplaceAll(ja.JWKURL, "")
-	cache := jwk.NewCache(context.Background(), jwk.WithErrSink(ja))
-	cache.Register(ja.JWKURL)
-	ja.jwkCache = cache
-	ja.refreshJWKCache()
-	ja.jwkCachedSet = jwk.NewCachedSet(cache, ja.JWKURL)
-	ja.logger.Info("using JWKs from URL", zap.String("url", ja.JWKURL), zap.Int("loaded_keys", ja.jwkCachedSet.Len()))
+	// Initialiser le cache pour toutes les URL possibles
+	ja.jwkCaches = make(map[string]*struct {
+		cache     *jwk.Cache
+		cachedSet jwk.Set
+	})
+	ja.logger.Info("JWK cache initialized for placeholder URL", zap.String("placeholder_url", ja.JWKURL))
 }
 
-// refreshJWKCache refreshes the JWK cache. It validates the JWKs from the given URL.
-func (ja *JWTAuth) refreshJWKCache() {
-	_, err := ja.jwkCache.Refresh(context.Background(), ja.JWKURL)
-	ja.logger.Warn("failed to refresh JWK cache", zap.Error(err))
+// getOrCreateJWKCache récupère ou crée un cache pour une URL JWK spécifique
+func (ja *JWTAuth) getOrCreateJWKCache(resolvedURL string) (*struct {
+	cache     *jwk.Cache
+	cachedSet jwk.Set
+}, error) {
+	// Si l'URL est vide, retourner une erreur
+	if resolvedURL == "" {
+		return nil, fmt.Errorf("resolved JWK URL is empty")
+	}
+
+	// Vérifier si le cache existe déjà pour cette URL
+	if entry, ok := ja.jwkCaches[resolvedURL]; ok {
+		return entry, nil
+	}
+
+	// Créer un nouveau cache pour cette URL
+	cache := jwk.NewCache(context.Background(), jwk.WithErrSink(ja))
+	err := cache.Register(resolvedURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register JWK URL: %w", err)
+	}
+
+	// Essayer de rafraîchir le cache immédiatement
+	_, err = cache.Refresh(context.Background(), resolvedURL)
+	if err != nil {
+		ja.logger.Warn("failed to refresh JWK cache during initialization", zap.Error(err), zap.String("url", resolvedURL))
+		// On continue même en cas d'erreur, l'important est que l'URL soit enregistrée
+	}
+
+	cachedSet := jwk.NewCachedSet(cache, resolvedURL)
+	entry := &struct {
+		cache     *jwk.Cache
+		cachedSet jwk.Set
+	}{
+		cache:     cache,
+		cachedSet: cachedSet,
+	}
+
+	// Enregistrer l'entrée dans le cache
+	ja.jwkCaches[resolvedURL] = entry
+	ja.logger.Info("new JWK cache created", zap.String("url", resolvedURL), zap.Int("loaded_keys", cachedSet.Len()))
+
+	return entry, nil
+}
+
+// refreshJWKCache refreshes the JWK cache for a specific URL. It validates the JWKs from the given URL.
+func (ja *JWTAuth) refreshJWKCache(resolvedURL string) error {
+	entry, err := ja.getOrCreateJWKCache(resolvedURL)
+	if err != nil {
+		return err
+	}
+
+	_, err = entry.cache.Refresh(context.Background(), resolvedURL)
+	if err != nil {
+		ja.logger.Warn("failed to refresh JWK cache", zap.Error(err), zap.String("url", resolvedURL))
+		return err
+	}
+	return nil
 }
 
 // Validate implements caddy.Validator interface.
@@ -219,6 +273,8 @@ func (ja *JWTAuth) Validate() error {
 
 func (ja *JWTAuth) validateSignatureKeys() error {
 	if ja.usingJWK() {
+		// Initialiser la structure de cache sans tenter de résoudre les placeholders
+		// Les URL seront résolues lors de l'utilisation
 		ja.setupJWKLoader()
 	} else {
 		if keyBytes, asymmetric, err := parseSignKey(ja.SignKey); err != nil {
@@ -245,18 +301,28 @@ func (ja *JWTAuth) validateSignatureKeys() error {
 }
 
 func (ja *JWTAuth) keyProvider() jws.KeyProviderFunc {
-	return func(_ context.Context, sink jws.KeySink, sig *jws.Signature, _ *jws.Message) error {
+	return func(context context.Context, sink jws.KeySink, sig *jws.Signature, _ *jws.Message) error {
 		if ja.usingJWK() {
+			// Résoudre les placeholders dans l'URL JWK à chaque requête
+			resolvedURL := context.Value(caddy.ReplacerCtxKey).(*caddy.Replacer).ReplaceAll(ja.JWKURL, "")
+
+			// Obtenir ou créer le cache pour cette URL
+			cacheEntry, err := ja.getOrCreateJWKCache(resolvedURL)
+			if err != nil {
+				return fmt.Errorf("failed to get JWK cache: %w", err)
+			}
+
+			// Utiliser le jeu de clés associé à cette URL
 			kid := sig.ProtectedHeaders().KeyID()
-			key, found := ja.jwkCachedSet.LookupKeyID(kid)
+			key, found := cacheEntry.cachedSet.LookupKeyID(kid)
 			if !found {
-				// trigger a refresh if the key is not found
-				go ja.refreshJWKCache()
+				// Déclencher un rafraîchissement asynchrone si la clé n'est pas trouvée
+				go ja.refreshJWKCache(resolvedURL)
 
 				if kid == "" {
 					return fmt.Errorf("missing kid in JWT header")
 				}
-				return fmt.Errorf("key specified by kid %q not found in JWKs", kid)
+				return fmt.Errorf("key specified by kid %q not found in JWKs from %s", kid, resolvedURL)
 			}
 			sink.Key(ja.determineSigningAlgorithm(key.Algorithm(), sig.ProtectedHeaders().Algorithm()), key)
 		} else if ja.SignAlgorithm == string(jwa.EdDSA) {
@@ -518,15 +584,15 @@ func desensitizedTokenString(token string) string {
 func parseSignKey(signKey string) (keyBytes []byte, asymmetric bool, err error) {
 	repl := caddy.NewReplacer()
 	// Replace placeholders in the signKey such as {file./path/to/sign_key.txt}
-	signKey = repl.ReplaceAll(signKey, "")
-	if len(signKey) == 0 {
+	resolvedSignKey := repl.ReplaceAll(signKey, "")
+	if len(resolvedSignKey) == 0 {
 		return nil, false, ErrMissingKeys
 	}
-	if strings.Contains(signKey, "-----BEGIN PUBLIC KEY-----") {
-		keyBytes, err = parsePEMFormattedPublicKey(signKey)
+	if strings.Contains(resolvedSignKey, "-----BEGIN PUBLIC KEY-----") {
+		keyBytes, err = parsePEMFormattedPublicKey(resolvedSignKey)
 		return keyBytes, true, err
 	}
-	keyBytes, err = base64.StdEncoding.DecodeString(signKey)
+	keyBytes, err = base64.StdEncoding.DecodeString(resolvedSignKey)
 	return keyBytes, false, err
 }
 
