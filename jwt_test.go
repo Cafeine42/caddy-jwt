@@ -1,11 +1,13 @@
 package caddyjwt
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"github.com/caddyserver/caddy/v2"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -788,6 +790,11 @@ func TestJWK(t *testing.T) {
 	token := issueTokenStringJWK(MapClaims{"sub": "ggicci"})
 	rw := httptest.NewRecorder()
 	r, _ := http.NewRequest("GET", "/", nil)
+
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl)
+	r = r.WithContext(ctx)
+
 	r.Header.Add("Authorization", "Bearer "+token)
 	gotUser, authenticated, err := ja.Authenticate(rw, r)
 	assert.Nil(t, err)
@@ -811,6 +818,11 @@ func TestJWKSet(t *testing.T) {
 	token := issueTokenStringJWK(MapClaims{"sub": "ggicci"})
 	rw := httptest.NewRecorder()
 	r, _ := http.NewRequest("GET", "/", nil)
+
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl)
+	r = r.WithContext(ctx)
+
 	r.Header.Add("Authorization", "Bearer "+token)
 	gotUser, authenticated, err := ja.Authenticate(rw, r)
 	assert.Nil(t, err)
@@ -834,6 +846,11 @@ func TestJWKSet_KeyNotFound(t *testing.T) {
 	token := issueTokenStringJWK(MapClaims{"sub": "ggicci"})
 	rw := httptest.NewRecorder()
 	r, _ := http.NewRequest("GET", "/", nil)
+
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl)
+	r = r.WithContext(ctx)
+
 	r.Header.Add("Authorization", "Bearer "+token)
 	gotUser, authenticated, err := ja.Authenticate(rw, r)
 
