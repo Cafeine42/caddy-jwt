@@ -300,11 +300,12 @@ func (ja *JWTAuth) validateSignatureKeys() error {
 	return nil
 }
 
-func (ja *JWTAuth) keyProvider() jws.KeyProviderFunc {
+func (ja *JWTAuth) keyProvider(request *http.Request) jws.KeyProviderFunc {
 	return func(context context.Context, sink jws.KeySink, sig *jws.Signature, _ *jws.Message) error {
 		if ja.usingJWK() {
 			// Resolve JWKURL with placeholders
-			resolvedURL := caddy.NewReplacer().ReplaceAll(ja.JWKURL, "")
+			replacer := request.Context().Value(caddy.ReplacerCtxKey).(caddy.Replacer)
+			resolvedURL := replacer.ReplaceAll(ja.JWKURL, "")
 
 			ja.logger.Info("JWK unresolved", zap.String("placeholder_url", ja.JWKURL))
 			ja.logger.Info("JWK resolved", zap.String("placeholder_url", resolvedURL))
@@ -376,7 +377,7 @@ func (ja *JWTAuth) Authenticate(rw http.ResponseWriter, r *http.Request) (User, 
 			jwt.WithVerify(!ja.SkipVerification),
 		}
 		if !ja.SkipVerification {
-			jwtOptions = append(jwtOptions, jwt.WithKeyProvider(ja.keyProvider()))
+			jwtOptions = append(jwtOptions, jwt.WithKeyProvider(ja.keyProvider(r)))
 		}
 		gotToken, err = jwt.ParseString(tokenString, jwtOptions...)
 
